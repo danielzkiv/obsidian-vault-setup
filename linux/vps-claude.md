@@ -1,90 +1,167 @@
-# VPS Claude — Linux Client Onboarding
+# VPS Claude — Linux Client Setup & Operations
 
-> **Paired instruction file:** [`local-claude.md`](./local-claude.md) — runbook for the Claude instance on the Linux client. Read it first so you know what the other side will be doing and what signals to expect.
-> **Architecture context:** [`../PLAN-LINUX.md`](../PLAN-LINUX.md) — full setup plan, including the role model.
+> **Paired file:** [`local-claude.md`](./local-claude.md) — runbook for the Claude instance on the Linux client. Read it first so you know what the other side will do and what to hand back.
 
-## Your role
+Self-contained runbook for the Claude instance on the **VPS** when onboarding or maintaining a Linux read-only mirror. The VPS side is identical regardless of client OS — this file is a Linux-client-flavored copy of `windows/vps-claude.md` for symmetry so the folder pair is self-contained.
 
-You are running on the **VPS**. The VPS is the **sole writer** to `/root/obsidian-vault/`. Any Linux client is a **read-only mirror**. Your job is to keep the VPS side correct and help the Linux-side Claude get onto the share as receive-only.
+---
 
-## VPS-side invariants to maintain
+## 1. Architecture & role model
+
+Set up Syncthing on the headless VPS to sync `/root/obsidian-vault/` with a Linux desktop/laptop running Obsidian Desktop. Claude's memory is symlinked into the vault.
+
+**Role model:** VPS is the **sole writer**. The Linux client is a **read-only mirror**.
+- VPS folder type: `sendonly`.
+- Client folder type: `receiveonly`.
+- Rationale: Claude on the VPS is the main author. Read-only clients prevent two-writer conflicts.
+
+---
+
+## 2. VPS-side invariants
 
 | Setting | Required value | Why |
 |---|---|---|
-| Folder `obsidian-vault` type | `sendonly` | VPS-only writes propagate out; nothing from clients is accepted |
-| `.stignore` content | `.obsidian/workspace*`, `.obsidian/cache*`, `.obsidian/graph.json`, `.obsidian/app.json`, `.trash/` | Ignore patterns propagate to clients; keeps Obsidian per-device UI state from flagging as "Local Additions" on mirrors |
-| Web UI bind | `127.0.0.1:8384` only | Never exposed to the internet; reconfigure via SSH tunnel |
-| Versioning | `simple`, keep 5 | Safety net for accidental VPS-side deletes |
-| New devices | `autoAcceptFolders: false` | Prevents surprise-accept on client-side quirks |
+| Folder `obsidian-vault` type | `sendonly` | VPS-only writes propagate out |
+| `.stignore` content | `.obsidian/workspace*`, `.obsidian/cache*`, `.obsidian/graph.json`, `.obsidian/app.json`, `.trash/` | Propagates to clients; keeps Obsidian UI state from flagging as Local Additions |
+| Web UI bind | `127.0.0.1:8384` only | Never exposed |
+| Versioning | `simple`, keep 5 | Safety net |
+| New devices | `autoAcceptFolders: false` | Prevents surprise-accept |
 
-## API cheatsheet
+---
+
+## 3. Install Syncthing on the VPS (first-time)
+
+1. Add Syncthing's apt repo + signing key to `/etc/apt/keyrings/syncthing-archive-keyring.gpg` and `/etc/apt/sources.list.d/syncthing.list`.
+2. `apt update && apt install syncthing` → pulls v1.30+.
+3. `systemctl enable --now syncthing@root.service`.
+4. Verify: `systemctl is-active syncthing@root` → `active`; `ss -tlnp | grep -E ':8384|:22000'` → both listeners.
+
+---
+
+## 4. Configure Syncthing on the VPS
 
 ```bash
 CONFIG=/root/.local/state/syncthing/config.xml
 API=$(grep -oP '<apikey>\K[^<]+' "$CONFIG")
 BASE=http://127.0.0.1:8384/rest
-
-# Verify folder role
-curl -sH "X-API-Key: $API" "$BASE/config/folders/obsidian-vault" | jq '{type, devices: [.devices[].deviceID[:7]]}'
-
-# Patch to sendonly (idempotent)
-curl -sX PATCH -H "X-API-Key: $API" -H "Content-Type: application/json" \
-  -d '{"type":"sendonly"}' "$BASE/config/folders/obsidian-vault"
-
-# Connection status for a specific device
-curl -sH "X-API-Key: $API" "$BASE/system/connections" | jq '.connections'
-
-# Folder status (globalFiles, localFiles, needBytes, etc.)
-curl -sH "X-API-Key: $API" "$BASE/db/status?folder=obsidian-vault"
 ```
 
-## Onboarding flow (when a new Linux client joins)
+1. Bind UI to loopback — `127.0.0.1:8384` (default).
+2. `PATCH /rest/config/gui` → set `admin` user + password (bcrypted server-side).
+3. `DELETE /rest/config/folders/default` → remove the unused auto-created folder.
+4. Add the vault as `sendonly`:
+   ```bash
+   curl -sX POST -H "X-API-Key: $API" -H "Content-Type: application/json" \
+     -d '{"id":"obsidian-vault","label":"Obsidian Vault","path":"/root/obsidian-vault",
+          "type":"sendonly","fsWatcherEnabled":true,"fsWatcherDelayS":5,
+          "versioning":{"type":"simple","params":{"keep":"5"}},"devices":[]}' \
+     "$BASE/config/folders"
+   ```
+5. Write `.stignore` in `/root/obsidian-vault/`:
+   ```
+   .obsidian/workspace*
+   .obsidian/cache*
+   .obsidian/graph.json
+   .obsidian/app.json
+   .trash/
+   ```
+6. No restart needed.
 
-1. **Pre-flight:** confirm the VPS invariants above. Patch any drift. Do not proceed otherwise.
-2. **Wait for Device ID** from the Linux-side Claude (see step 2 of `local-claude.md`).
-3. **Register the Linux device** with `autoAcceptFolders: false` explicitly set:
+---
+
+## 5. Firewall & connectivity
+
+1. TCP 22000 reachable from the internet (Syncthing sync port). `ufw allow 22000/tcp` if UFW is active.
+2. Leave 21027/udp closed (LAN discovery, irrelevant over the internet).
+3. Confirm `globalAnnounceEnabled: true` + `relaysEnabled: true` via `GET /rest/config/options`.
+4. Print VPS Device ID: `syncthing --device-id --home=/root/.local/state/syncthing`.
+5. Baseline firewall posture: Hetzner Cloud Firewall at the provider level (allow 22, 22000, 80, 443; deny rest) — UFW alone is misleading when Docker is editing iptables directly.
+
+---
+
+## 6. Onboarding flow (new Linux client joins)
+
+1. **Pre-flight:** confirm invariants from §2.
+2. **Wait for Device ID** from Linux-side Claude (see `local-claude.md` step 2).
+3. **Register the Linux device** with `autoAcceptFolders: false`:
    ```bash
    curl -sX PUT -H "X-API-Key: $API" -H "Content-Type: application/json" \
      -d '{"deviceID":"<LINUX-ID>","name":"Linux","compression":"metadata","autoAcceptFolders":false,"addresses":["dynamic"]}' \
      "$BASE/config/devices/<LINUX-ID>"
    ```
-4. **Add the device to the folder's share list:**
+4. **Add the device to the folder's share list** (append, don't wipe):
    ```bash
-   # Fetch current device list first, then PATCH with the appended entry; do not replace wholesale.
    curl -sH "X-API-Key: $API" "$BASE/config/folders/obsidian-vault" \
      | jq '.devices += [{"deviceID":"<LINUX-ID>"}]' \
      | curl -sX PUT -H "X-API-Key: $API" -H "Content-Type: application/json" -d @- \
        "$BASE/config/folders/obsidian-vault"
    ```
-5. **Confirm connection established** (`"connected": true` via `/system/connections`). If not, check that TCP 22000 is reachable from the client side and that global discovery is working.
-6. **Wait for the Linux-side Claude to confirm** folder type is `receiveonly` and `receiveOnlyTotalItems: 0`. If nonzero, coordinate a Revert Local Changes on their side before running the isolation test.
-7. **Run the isolation test with them** (see next section).
+5. **Confirm connection:** `GET /system/connections` shows `"connected": true` for the Linux device. If not, check TCP 22000 reachability.
+6. **Wait for client confirmation**: folder type `receiveonly`, `receiveOnlyTotalItems: 0`. If nonzero, coordinate a revert before testing.
+7. **Run isolation test jointly** (§8).
 
-## Isolation test protocol (run jointly with Linux-side Claude)
+---
 
-This verifies the read-only contract in actual behavior, not just config.
+## 7. Wire Claude's memory into the vault
 
-1. Your turn: `ls /root/obsidian-vault/` — snapshot the current file list. Report it.
-2. Linux side creates `test-from-linux.md` with some content.
+1. Move existing memory from `/root/.claude/projects/-root-projects-bdi-senior-developer/memory/` → `/root/obsidian-vault/claude-memory/`.
+2. Remove the now-empty original directory.
+3. Symlink: `/root/.claude/.../memory → /root/obsidian-vault/claude-memory`.
+4. Verify with a test memory write.
+5. Add a `MOC.md` index note in `claude-memory/` for graph-view entry.
+
+---
+
+## 8. Isolation test protocol (joint with Linux-side Claude)
+
+1. You: `ls /root/obsidian-vault/` — snapshot file list.
+2. Linux side creates `test-from-linux.md`.
 3. Wait ~30 seconds.
-4. Your side: re-list `/root/obsidian-vault/` — the new file must **not** appear. Also:
-   ```bash
-   curl -sH "X-API-Key: $API" "$BASE/db/status?folder=obsidian-vault" | jq '.globalFiles, .localFiles'
-   ```
-   Counts should be unchanged from pre-test.
-5. Linux side reverts local changes. Confirm with them the file is gone from their machine.
-6. Final check on VPS: nothing changed, nothing in `.stversions/` from the test.
+4. You: re-list + `curl -sH "X-API-Key: $API" "$BASE/db/status?folder=obsidian-vault" | jq '.globalFiles, .localFiles'`. Counts unchanged, new file absent.
+5. Linux side reverts. Confirm gone on their side.
+6. Final VPS check: nothing changed, no new `.stversions/` entry.
 
-**Pass criteria:** step 4 shows zero propagation from client to VPS. Any propagation = folder type drifted or was never applied. Fix before marking the setup done.
+**Pass criteria:** step 4 shows zero propagation.
 
-## When to push a change to clients
+**Other propagation checks (should keep working):**
+- VPS → Linux file create: `touch /root/obsidian-vault/test-from-vps.md` → lands on Linux within seconds.
+- VPS → Linux rename: `mv` on VPS → rename (not duplicate) lands on Linux.
+- Claude memory write via symlink → lands in `claude-memory/` on Linux.
 
-Writes to `/root/obsidian-vault/` (from you, the user, or Claude memory) propagate automatically. No extra action needed.
+---
 
-`.stignore` edits propagate on the next folder scan.
+## 9. Day-to-day ops
 
-## What NOT to do
+- Routine writes: write to `/root/obsidian-vault/`; Syncthing propagates.
+- `.stignore` changes propagate on next scan.
+- Remote UI: `ssh -L 8384:localhost:8384 root@vps`, then `http://127.0.0.1:8384`.
 
-- Do not change folder type back to `sendreceive`. If a Linux client needs write access, that's a separate repo/vault, not this one.
-- Do not `DELETE` a client device to "reset" it without coordinating with the Linux-side Claude.
-- Do not expose `127.0.0.1:8384` to the public internet. SSH port-forward for remote UI access.
+---
+
+## 10. Rollback plan
+
+- Syncthing install broken: `apt remove syncthing`, `rm -rf /root/.local/state/syncthing`.
+- Memory symlink broke Claude: `rm` the symlink, `mv` the directory back.
+
+---
+
+## 11. Gotchas & risks (VPS side)
+
+1. **Loopback-only UI + password** — SSH tunnel for remote reconfig. Accept the tradeoff.
+2. **Symlinked memory path** — if Claude's runtime does `realpath` or refuses symlinks, fall back to bind mount or file-sync hook.
+3. **Initial sync** will include `.obsidian/` subfolders the Linux client creates (themes, plugins). Mostly filtered by `.stignore`; rest is harmless.
+4. **UFW vs Docker** — Docker edits iptables directly, bypassing UFW rules. Use provider-level firewall (Hetzner Cloud Firewall) for public traffic filtering.
+
+---
+
+## 12. What NOT to do
+
+- Do not change folder type back to `sendreceive`.
+- Do not `DELETE` a client device without coordinating.
+- Do not expose `127.0.0.1:8384` to the public internet.
+
+---
+
+## 13. Why Syncthing, not LiveSync
+
+LiveSync needs a headless Obsidian process to see filesystem writes from Claude — fragile and ~600MB RAM. Syncthing is filesystem-native (~30MB RAM, one daemon) and transparent to any writer.
