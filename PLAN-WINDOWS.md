@@ -1,5 +1,7 @@
 # Plan: Syncthing + Claude Memory Integration
 
+> **Status: ✅ Executed successfully on 2026-04-15.** All six phases complete, end-to-end tests passed. See [Execution notes](#execution-notes-2026-04-15-run) at the bottom for what actually happened, including the two gotchas that cost time.
+
 ## Overview
 Set up Syncthing on the headless VPS to sync `/root/obsidian-vault/` with a Windows machine running Obsidian Desktop. Redirect Claude Code's memory system into the vault via a symlink so every memory Claude writes becomes a synced note.
 
@@ -172,10 +174,49 @@ Recorded here so the plan matches what actually happened, not just the theory.
 - VPS device already added on Windows side (ID above, name `VPS`, addresses: dynamic and `tcp://178.104.79.53:22000`).
 - Windows Device ID: to be handed to VPS-side Claude for pre-approval (next step).
 
-**Outstanding before Phase 5:**
-- Windows Device ID → VPS: add to folder `obsidian-vault` devices list
-- Accept folder share prompt on Windows side
-- Install Obsidian Desktop on Windows, open the synced folder as a vault
+**Pairing (completed):**
+- Windows Device ID `SC4OMBT-DXFA2MJ-5GYZZF3-352NVIF-YJNCWUK-LUBDVUO-WZAI5Z4-VD3EYAB` added as trusted device on the VPS (name `Windows`, compression: metadata).
+- Folder `obsidian-vault` shared to Windows; connection established to `95.135.208.15:443` within seconds.
+- Windows accepted folder share, set path `C:\Users\<user>\ObsidianVault`.
+- Obsidian Desktop installed on Windows, vault opened successfully.
+
+**Phase 5 (completed) — Claude memory in vault:**
+- `/root/.claude/projects/-root-projects-bdi-senior-developer/memory` symlinked → `/root/obsidian-vault/claude-memory/`.
+- `MEMORY.md` index + `MOC.md` graph-view entry point + first real memory (`memory_location.md` documenting the symlink itself) written and synced to Windows at 100%.
+
+**Phase 6 (completed) — end-to-end tests:**
+| Test | Result |
+|---|---|
+| VPS → Windows | ✅ `test-from-vps.md` synced within seconds |
+| Windows → VPS | ✅ `Untitled.md` then renamed to `test-from-windows.md` synced |
+| Rename propagation | ✅ confirmed (old snapshot captured in `.stversions/`) |
+| Claude memory writes via symlink | ✅ all 3 memory files reached Windows |
+
+**Gotchas that bit us (documented in Risks section):**
+1. VS Code Remote-SSH auto-forwarded `localhost:8384` from Windows → VPS UI, masquerading as a local Syncthing. Cost ~20 minutes of debugging. Fix: always use `127.0.0.1` explicitly + SyncthingWindowsSetup fell back to port 8385 automatically.
+2. SyncTrayzor (initially attempted) is abandoned and incompatible with modern Syncthing CLI. Replaced with SyncthingWindowsSetup.
+3. Obsidian rename dialog doesn't show the `.md` extension; typing `file.md` in the rename box creates `file.md.md`. User-side knowledge, noted for next time.
+
+**Deliberately deferred:**
+- UFW baseline — VPS runs Docker containers publishing on 80/443. Because Docker manipulates iptables directly and bypasses UFW rules, UFW would give misleading security. Chose to use **Hetzner Cloud Firewall** (provider-level) instead — handled in the cloud console, cleanly filters public traffic without the Docker/iptables collision. Recommended rule set:
+  - Allow inbound: TCP 22 (SSH), TCP 22000 (Syncthing), TCP 80 + 443 (Docker-exposed services)
+  - Deny all other inbound
+  - Allow all outbound (default)
+- Cleanup of test files done: `test-from-vps.md` and `test-from-windows.md` removed from the vault.
+
+**Final vault state on VPS:**
+```
+/root/obsidian-vault/
+├── .obsidian/
+├── .stfolder
+├── .stignore
+├── .stversions/   (Syncthing's auto-versioned backups)
+├── claude-memory/
+│   ├── MEMORY.md
+│   ├── MOC.md
+│   └── memory_location.md
+└── Welcome.md
+```
 
 ---
 
