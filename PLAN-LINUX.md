@@ -20,27 +20,31 @@ VPS-side phases (1–3) are **identical** to the Windows plan — only the clien
 ## Phase 2 — Configure Syncthing on the VPS
 *(Identical to PLAN-WINDOWS.md Phase 2)*
 
+Driven via the Syncthing REST API (`http://127.0.0.1:8384/rest/...` with `X-API-Key` header).
+
 1. Bind web UI to loopback only (`127.0.0.1:8384`)
-2. Set a web-UI password
-3. Add folder `obsidian-vault` at `/root/obsidian-vault`, type Send & Receive, file-watcher on, Simple versioning (5 versions)
-4. Write `.stignore`:
+2. `PATCH /rest/config/gui` → set `admin` user + generated password (bcrypted server-side)
+3. `DELETE /rest/config/folders/default` → remove the auto-created unused folder
+4. `POST /rest/config/folders` → add folder `obsidian-vault` at `/root/obsidian-vault`, type `sendreceive`, file-watcher on (5s delay), `simple` versioning keeping 5
+5. Write `.stignore` in `/root/obsidian-vault/`:
    ```
    .obsidian/workspace.json
    .obsidian/workspace-*.json
    .obsidian/cache
    .trash/
    ```
-5. Restart Syncthing
+6. No explicit restart needed — REST config changes are applied live.
 
 ---
 
 ## Phase 3 — Firewall + connectivity
 *(Identical to PLAN-WINDOWS.md Phase 3)*
 
-1. Open TCP 22000 on UFW
-2. Leave 21027/udp closed
-3. Confirm global discovery + relays enabled
-4. Print VPS Device ID for pairing
+1. TCP 22000 reachable from the internet (add `ufw allow 22000/tcp` if UFW is enabled; on this VPS UFW was inactive, so it was already reachable)
+2. Leave 21027/udp closed (local LAN discovery, irrelevant over the internet)
+3. Confirm global discovery + relays enabled via `GET /rest/config/options`
+4. Print VPS Device ID for pairing (`syncthing --device-id --home=/root/.local/state/syncthing`)
+5. Flag separately: UFW inactive overall → recommend baseline policy (allow 22/tcp + 22000/tcp) as follow-up work
 
 ---
 
@@ -73,14 +77,18 @@ sudo sysctl --system
 
 ### 4.4 Open the Syncthing web UI
 
-Navigate to `http://localhost:8384` — your **Device ID** is under *Actions → Show ID* (top right).
+Navigate to `http://127.0.0.1:8384` (use `127.0.0.1` explicitly, not `localhost` — see Gotcha #7 below about tunneled ports).
+
+**First-run:** Syncthing v1.29+ shows a "Set up authentication" dialog. Pick any username + password you'll remember — this is your local UI only, unrelated to the VPS creds.
+
+Your **Device ID** is under *Actions → Show ID* (top right).
 
 ### 4.5 Pair with the VPS
 
-1. Web UI → *Add Remote Device* → paste the VPS Device ID
-2. **Tell me when done** — I'll approve the reverse prompt on the VPS side (or pre-add your Device ID)
-3. When the folder share prompt appears, accept `obsidian-vault` and pick a local path, e.g. `~/ObsidianVault`
-4. Wait for initial sync (near-instant for a small vault)
+1. Web UI → *Add Remote Device* → paste the VPS Device ID, name it `VPS`, leave addresses `dynamic` (or add `tcp://<VPS-public-IP>:22000`)
+2. **Hand your Device ID back to the VPS-side Claude** — it pre-approves your device and shares the `obsidian-vault` folder with it
+3. Within ~30s a "VPS wants to share folder obsidian-vault" prompt appears on your side → accept, set folder path to `~/ObsidianVault`
+4. Initial sync runs (near-instant for a small vault)
 
 ### 4.6 Install Obsidian Desktop
 
@@ -132,6 +140,7 @@ Obsidian → *Open folder as vault* → select `~/ObsidianVault`.
 4. **SELinux / AppArmor** — on enforcing SELinux (Fedora/RHEL), if the vault is on an NFS or non-standard path, you may need extra booleans. Not needed for a local home dir.
 5. **Wayland vs X11** — Obsidian runs on both, no action needed. On some Wayland setups, file-open dialogs via portals are slower the first time.
 6. **Multiple Linux devices** — you can add a second Linux host (laptop + desktop) by pairing each with the VPS; the VPS stays source of truth, both clients sync from it.
+7. **VS Code Remote-SSH auto-forwards ports** — if you have a VS Code Remote-SSH session open to the VPS, VS Code silently forwards `localhost:8384` from your desktop to the VPS's loopback Syncthing UI. Symptom: on your Linux desktop you open `http://localhost:8384`, see a login page, and the VPS admin creds work on it. That's not your local Syncthing — that's the VPS's UI through a tunnel. Fix: always use `http://127.0.0.1:8384` explicitly (VS Code only rewrites `localhost`), or close the VS Code SSH session first. On Linux this is less disruptive than on Windows (systemd user service binds to `127.0.0.1:8384` directly and starts fine alongside the tunnel), but it *will* confuse you the first time.
 
 ---
 

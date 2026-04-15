@@ -8,61 +8,101 @@ Set up Syncthing on the headless VPS to sync `/root/obsidian-vault/` with a Wind
 ## Phase 1 — Install Syncthing on the VPS
 
 1. **Install from Syncthing's apt repo** (not Ubuntu's, which lags versions)
-   - Add `https://syncthing.net/release-key.gpg` keyring
-   - Add `deb https://apt.syncthing.net/ syncthing stable` to `/etc/apt/sources.list.d/syncthing.list`
+   - Add `https://syncthing.net/release-key.gpg` keyring to `/etc/apt/keyrings/syncthing-archive-keyring.gpg`
+   - Add `deb [signed-by=/etc/apt/keyrings/syncthing-archive-keyring.gpg] https://apt.syncthing.net/ syncthing stable` to `/etc/apt/sources.list.d/syncthing.list`
    - `apt update && apt install syncthing`
-   - Pins us to v1.29+ which has the improved file watcher and relay behavior noted in the research
+   - Pulls v1.30+ (Ubuntu 24.04's default is 1.27, too old for the CLI changes SyncthingWindowsSetup expects on the client side)
 
 2. **Enable as a systemd service** running under `root` (so it can read/write the vault)
    - `systemctl enable --now syncthing@root.service`
    - Auto-starts on boot, restarts on crash
 
-3. **Verify startup** — check `systemctl status syncthing@root` and confirm it's listening on `127.0.0.1:8384`
+3. **Verify startup** — `systemctl is-active syncthing@root` should say `active`; `ss -tlnp | grep -E ':8384|:22000'` should show both listeners (loopback-only on 8384, all interfaces on 22000).
 
 ---
 
 ## Phase 2 — Configure Syncthing on the VPS
 
-Edit `/root/.local/state/syncthing/config.xml` (or use the web UI via SSH tunnel — I'll do it via the API/config for reproducibility):
+Driven via the Syncthing REST API (`http://127.0.0.1:8384/rest/...` with `X-API-Key` header — the key is in the auto-generated `/root/.local/state/syncthing/config.xml`). Doing it through the API instead of hand-editing XML is idempotent and survives Syncthing restarts.
 
-1. **Bind web UI to loopback only** — `127.0.0.1:8384` (default, but confirm). Never exposed to the internet.
-2. **Set a web-UI password** (so even if the loopback is accessed via tunnel by someone else, it's protected)
-3. **Add the vault as a shared folder**:
+1. **Bind web UI to loopback only** — `127.0.0.1:8384` (Syncthing's default, but confirm). Never exposed to the internet.
+2. **Set a web-UI user + password** — `PATCH /rest/config/gui` with `{"user": "admin", "password": "<generated>"}`. Syncthing bcrypts the plaintext on save. The password only matters if someone opens an SSH tunnel to the loopback UI — it's a defence-in-depth layer, not the primary control (SSH is).
+3. **Remove the auto-created `default` folder** (`/root/Sync`, unused) — `DELETE /rest/config/folders/default`.
+4. **Add the vault as a shared folder** — `POST /rest/config/folders`:
    - Folder ID: `obsidian-vault`
    - Path: `/root/obsidian-vault`
-   - Type: `Send & Receive`
-   - File watcher: enabled (default)
-   - Versioning: `Simple` with 5 versions (cheap safety net for accidental deletes from either side)
-4. **Write `.stignore`** inside the vault:
+   - Type: `sendreceive`
+   - File watcher: enabled, 5s delay
+   - Versioning: `simple` with 5 versions kept (cheap safety net for accidental deletes from either side)
+   - Devices: empty for now — added in Phase 3 once the Windows Device ID is known.
+5. **Write `.stignore`** inside the vault:
    ```
    .obsidian/workspace.json
    .obsidian/workspace-*.json
    .obsidian/cache
    .trash/
    ```
-5. **Restart Syncthing** to pick up config
+6. **No explicit restart needed** — REST config changes are applied live.
 
 ---
 
 ## Phase 3 — Firewall + connectivity
 
-1. **Open TCP 22000** on UFW (Syncthing's sync port)
-2. **Leave 21027/udp closed** (local discovery — irrelevant over the internet, and Syncthing uses the global discovery + relays instead)
-3. **Confirm global discovery + relays enabled** (default, but verify) — this is what lets your home Windows machine find the VPS through NAT without port forwarding on your side
-4. **Print the VPS's Device ID** so you can paste it into SyncTrayzor
+1. **TCP 22000 must be reachable from the internet** (Syncthing's sync port). On this VPS UFW was inactive at setup time, so 22000 was already open — but if/when UFW is enabled, add `ufw allow 22000/tcp`.
+2. **Leave 21027/udp closed** (local LAN discovery — irrelevant over the internet, and Syncthing uses global discovery + relays instead).
+3. **Confirm global discovery + relays enabled** (default, but verify via `GET /rest/config/options` — `globalAnnounceEnabled: true`, `relaysEnabled: true`). This is what lets the home Windows machine find the VPS through NAT without port forwarding on the home side.
+4. **Print the VPS's Device ID** (`syncthing --device-id --home=/root/.local/state/syncthing`) — needed for the Windows pairing step.
+5. **Flag separately**: this VPS has UFW inactive overall → every port is exposed by default. Good for Syncthing but poor posture in general; recommend a baseline UFW policy (allow 22/tcp + 22000/tcp, deny rest) after this plan finishes. Not in scope here.
 
 ---
 
-## Phase 4 — Windows-side instructions (for you to execute)
+## Phase 4 — Windows-side instructions (user executes)
 
-Concise handoff:
+> **Do NOT use SyncTrayzor.** It's abandoned (last release 2023) and invokes Syncthing with flags that were removed in v1.27+ — you'll see errors like `unknown flag -n` with no functional UI. Use SyncthingWindowsSetup instead.
 
-1. Download + install [SyncTrayzor](https://github.com/canton7/SyncTrayzor) (latest release installer)
-2. First-run — it auto-generates your Device ID
-3. Add remote device — paste the VPS Device ID; approve the reverse pairing prompt that appears on my side (I'll need you to tell me when you send it so I approve on the VPS)
-4. Accept the `obsidian-vault` folder share — pick local path `C:\Users\<you>\ObsidianVault`
-5. Wait for initial sync (will be ~instant, vault is nearly empty)
-6. Open Obsidian Desktop → "Open folder as vault" → select `C:\Users\<you>\ObsidianVault`
+### 4.1 Confirm no Syncthing is already running
+
+Before installing, verify there's no stale Syncthing/SyncTrayzor install:
+
+```powershell
+netstat -ano | findstr :8384
+```
+
+If something's listening, investigate before installing — a common surprise is a **VS Code Remote-SSH port forward** silently tunneling `localhost:8384` to the VPS's loopback UI (see Gotcha #4 below). Close it or expect port 8385 fallback in 4.2.
+
+### 4.2 Install Syncthing via SyncthingWindowsSetup
+
+1. Download the latest installer from [SyncthingWindowsSetup](https://github.com/Bill-Stewart/SyncthingWindowsSetup/releases/latest) (actively maintained successor to SyncTrayzor's "install and forget" role)
+2. Run `syncthing-x64-*.exe`. Defaults are fine: per-user service, autostart at logon, web UI on `localhost:8384`
+3. **Port fallback:** if 8384 is occupied (e.g. by a VS Code tunnel), the installer falls back to `127.0.0.1:8385`. Note the actual port from the installer's summary page.
+4. **First GUI access** — navigate to `http://127.0.0.1:<port>` (8384 or 8385). Modern Syncthing (v1.29+) shows a "Set up authentication" dialog on first access. Pick your own username + password; this is *your* Windows UI only, unrelated to the VPS creds.
+
+### 4.3 Add the VPS as a remote device
+
+In the Syncthing web UI → bottom right → **Add Remote Device**:
+- Device ID: the VPS Device ID (given to you after Phase 3)
+- Device Name: `VPS`
+- Addresses: leave `dynamic` (or add `tcp://<VPS-public-IP>:22000` for a faster first connect)
+- Save
+
+### 4.4 Hand the Windows Device ID back for VPS-side pairing
+
+In the Syncthing web UI → top-right **Actions → Show ID** → copy the long `XXXXXXX-XXXXXXX-...` string and paste it back to the VPS-side Claude. The VPS side then pre-approves this device and shares the `obsidian-vault` folder with it.
+
+### 4.5 Accept the folder share prompt
+
+Within ~30 seconds of the VPS adding your Device ID, the Windows Syncthing UI shows **"VPS wants to share folder obsidian-vault"**:
+1. Click **Add**
+2. **Folder Path**: `C:\Users\<you>\ObsidianVault` (or wherever you prefer)
+3. Save
+
+Initial sync runs (near-instant — vault is tiny).
+
+### 4.6 Install Obsidian Desktop
+
+1. Download from https://obsidian.md/download
+2. Install, open → *Open folder as vault* → select `C:\Users\<you>\ObsidianVault`
+3. You should see `Welcome.md` and any other files from the VPS immediately
 
 ---
 
@@ -101,11 +141,41 @@ Concise handoff:
 
 ---
 
-## Risks/considerations worth flagging
+## Risks & gotchas worth flagging
 
 1. **Loopback-only UI + password** means to reconfigure Syncthing later you'll open an SSH tunnel (`ssh -L 8384:localhost:8384 root@vps`). Acceptable tradeoff vs exposing the UI.
 2. **Symlinked memory path** — if Claude's runtime ever does a `realpath` check or refuses symlinks, we'll need to fall back to a bind mount or a file-sync hook. Not expected, but possible.
 3. **First initial sync** will include `.obsidian/` subfolders Windows Obsidian creates (themes, plugins). These will sync back to the VPS. Harmless but noted.
+4. **VS Code Remote-SSH auto-forwards ports** — if you have a VS Code Remote-SSH session open to the VPS, VS Code may silently forward `localhost:8384` from Windows to the VPS's loopback Syncthing UI. Symptom: on Windows you open `http://localhost:8384`, see a login page, and the VPS admin credentials work on it. That's not Windows Syncthing — that's the VPS's UI. Fix: either close the VS Code SSH session before installing Windows Syncthing, or let SyncthingWindowsSetup fall back to port 8385 on Windows. This was the single biggest source of confusion during first setup.
+5. **SyncTrayzor is abandoned** (last real release 2023) — using it against modern Syncthing (v1.27+) produces `unknown flag -n` errors because legacy flags were removed. If you inherit a machine with SyncTrayzor already installed, uninstall it before anything else.
+6. **Windows case-insensitive filesystem vs VPS case-sensitive** — `Note.md` and `note.md` are two files on the VPS but collide on Windows. Syncthing detects and logs these as errors. Avoid creating such pairs; if you see a case-conflict error in the Syncthing log, one of them has to be renamed.
+
+---
+
+## Execution notes (2026-04-15 run)
+
+Recorded here so the plan matches what actually happened, not just the theory.
+
+**VPS side — completed by Claude on VPS:**
+- Syncthing v1.30.0 installed from upstream apt repo; `syncthing@root.service` running.
+- Web UI bound to `127.0.0.1:8384`, user `admin` + generated password set.
+- Folder `obsidian-vault` created at `/root/obsidian-vault` with Simple versioning (keep 5).
+- `.stignore` written per spec.
+- Default `~/Sync` folder (auto-created) deleted.
+- VPS Device ID: `BVVAFG3-NQXBGAN-RRWY65A-EN63EDU-W7M6JVL-ZEUMN76-DTYE4RE-MRQVMA4`
+- UFW inactive; port 22000/tcp reachable externally by default. Flagged for follow-up.
+
+**Windows side — completed by Claude on local Windows machine:**
+- Clean install via SyncthingWindowsSetup v2.0.2 (per-user, autostart at logon).
+- No prior Syncthing install existed. The apparent "login page at localhost:8384" earlier was a **VS Code Remote-SSH port forward** to the VPS — not a local Syncthing. Stale Windows config from an aborted first attempt has been deleted.
+- Windows Syncthing GUI is on `127.0.0.1:8385` (VS Code still owns 8384 as the tunnel). No impact on the sync plane — only affects which port the local browser UI uses.
+- VPS device already added on Windows side (ID above, name `VPS`, addresses: dynamic and `tcp://178.104.79.53:22000`).
+- Windows Device ID: to be handed to VPS-side Claude for pre-approval (next step).
+
+**Outstanding before Phase 5:**
+- Windows Device ID → VPS: add to folder `obsidian-vault` devices list
+- Accept folder share prompt on Windows side
+- Install Obsidian Desktop on Windows, open the synced folder as a vault
 
 ---
 
