@@ -3,6 +3,11 @@
 ## Overview
 Same architecture as the Windows variant but with a **Linux desktop** as the client. Syncthing on the VPS ↔ Syncthing on the Linux desktop ↔ Obsidian Desktop opens the locally-synced folder. Claude's memory symlinks into the vault.
 
+**Role model:** the VPS is the **sole writer**. The Linux client (and any other client) is a **read-only mirror**.
+- VPS folder type: `sendonly` — create/edit/delete/rename here propagates outward.
+- Client folder type: `receiveonly` — Obsidian can open and render the vault, but any local change is flagged as "local additions" and rolled back on "Revert Local Changes"; it never reaches the VPS.
+- Rationale: Claude on the VPS is the main author. A read-only client avoids two-writer conflicts and accidental plugin writes.
+
 VPS-side phases (1–3) are **identical** to the Windows plan — only the client side (Phase 4) and a few gotchas differ.
 
 ---
@@ -25,12 +30,13 @@ Driven via the Syncthing REST API (`http://127.0.0.1:8384/rest/...` with `X-API-
 1. Bind web UI to loopback only (`127.0.0.1:8384`)
 2. `PATCH /rest/config/gui` → set `admin` user + generated password (bcrypted server-side)
 3. `DELETE /rest/config/folders/default` → remove the auto-created unused folder
-4. `POST /rest/config/folders` → add folder `obsidian-vault` at `/root/obsidian-vault`, type `sendreceive`, file-watcher on (5s delay), `simple` versioning keeping 5
-5. Write `.stignore` in `/root/obsidian-vault/`:
+4. `POST /rest/config/folders` → add folder `obsidian-vault` at `/root/obsidian-vault`, type `sendonly` (VPS is sole writer), file-watcher on (5s delay), `simple` versioning keeping 5
+5. Write `.stignore` in `/root/obsidian-vault/` (propagates to clients — keeps Obsidian per-device UI state from flagging as "local additions" on read-only mirrors):
    ```
-   .obsidian/workspace.json
-   .obsidian/workspace-*.json
-   .obsidian/cache
+   .obsidian/workspace*
+   .obsidian/cache*
+   .obsidian/graph.json
+   .obsidian/app.json
    .trash/
    ```
 6. No explicit restart needed — REST config changes are applied live.
@@ -85,10 +91,12 @@ Your **Device ID** is under *Actions → Show ID* (top right).
 
 ### 4.5 Pair with the VPS
 
-1. Web UI → *Add Remote Device* → paste the VPS Device ID, name it `VPS`, leave addresses `dynamic` (or add `tcp://<VPS-public-IP>:22000`)
+1. Web UI → *Add Remote Device* → paste the VPS Device ID, name it `VPS`, leave addresses `dynamic` (or add `tcp://<VPS-public-IP>:22000`). **Uncheck "Auto Accept"** on the Sharing tab — otherwise the folder offer will be auto-accepted as `sendreceive` before you can set it to receive-only.
 2. **Hand your Device ID back to the VPS-side Claude** — it pre-approves your device and shares the `obsidian-vault` folder with it
-3. Within ~30s a "VPS wants to share folder obsidian-vault" prompt appears on your side → accept, set folder path to `~/ObsidianVault`
-4. Initial sync runs (near-instant for a small vault)
+3. Within ~30s a "VPS wants to share folder obsidian-vault" prompt appears on your side → click Add, set folder path to `~/ObsidianVault`, and on the **Advanced tab set Folder Type: `Receive Only`**
+4. Initial sync runs (near-instant for a small vault). Verify `receiveOnlyTotalItems: 0` on the folder status — nonzero means something on the client was already written before the receive-only flag landed.
+
+**Behavioral consequence:** Obsidian on Linux can read and render the vault, but any edit/create/delete made locally stays local, is flagged as "Local Additions," and is rolled back by **Revert Local Changes**. Nothing from the client ever reaches the VPS.
 
 ### 4.6 Install Obsidian Desktop
 
@@ -120,12 +128,19 @@ Obsidian → *Open folder as vault* → select `~/ObsidianVault`.
 ---
 
 ## Phase 6 — Sanity test end-to-end
-*(Identical to PLAN-WINDOWS.md Phase 6)*
+*(Shape mirrors PLAN-WINDOWS.md Phase 6 — inverted for the sendonly/receiveonly contract.)*
 
-1. VPS → Linux: create `test-from-vps.md`, confirm it lands in Obsidian
-2. Linux → VPS: create a note in Obsidian, confirm it lands on VPS
-3. Claude memory: trigger a memory save, confirm it syncs to the Linux client
-4. Clean up test files
+1. **VPS → Linux propagation** — create `/root/obsidian-vault/test-from-vps.md` on the VPS, confirm it lands in Obsidian on the Linux client.
+2. **Linux → VPS isolation** (the inverted test — verifies the write is *blocked*, not that it propagates):
+   - Create a file (e.g. `test-from-linux.md`) inside `~/ObsidianVault/` via the shell or Obsidian.
+   - **Expected on Linux:** Syncthing UI shows non-zero **Local Additions** (`curl -sH "X-API-Key: $API" "http://127.0.0.1:8384/rest/db/status?folder=obsidian-vault" | jq .receiveOnlyTotalItems` returns > 0). File stays on disk locally.
+   - **Expected on VPS:** the file does **not** appear in `/root/obsidian-vault/`. Confirm with `ls` on the VPS and with `GET /rest/db/status?folder=obsidian-vault` — no new item in `globalFiles`.
+   - Clean up by clicking **Revert Local Changes** in the Linux UI → file removed locally; both sides back in sync.
+3. **Rename propagation VPS → Linux** — rename a file on the VPS, confirm the rename (not duplicate) lands on the Linux client.
+4. **Claude memory test** — trigger a memory save on the VPS, confirm it syncs to the Linux client.
+5. **Clean up test files** on the VPS (the sole writer).
+
+**Pass criteria:** tests 1, 3, 4 propagate cleanly VPS → client; test 2 confirms the client-side write is contained on the client and never reaches the VPS. Any failure of test 2 means the folder type was not actually set to `receiveonly` on the client — re-patch and re-run before considering the setup done.
 
 ---
 

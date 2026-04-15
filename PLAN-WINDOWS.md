@@ -5,6 +5,11 @@
 ## Overview
 Set up Syncthing on the headless VPS to sync `/root/obsidian-vault/` with a Windows machine running Obsidian Desktop. Redirect Claude Code's memory system into the vault via a symlink so every memory Claude writes becomes a synced note.
 
+**Role model:** the VPS is the **sole writer**. The Windows client (and any future client) is a **read-only mirror**.
+- VPS folder type: `sendonly` — create/edit/delete/rename here propagates outward.
+- Client folder type: `receiveonly` — Obsidian can open and render the vault, but any local change is flagged as "local additions" and rolled back on "Revert Local Changes"; it never reaches the VPS.
+- Rationale: Claude on the VPS is the main author (it writes memories and notes). A read-only client prevents case-collision bugs, accidental Obsidian-plugin writes, and two-writer conflict resolution entirely.
+
 ---
 
 ## Phase 1 — Install Syncthing on the VPS
@@ -33,15 +38,16 @@ Driven via the Syncthing REST API (`http://127.0.0.1:8384/rest/...` with `X-API-
 4. **Add the vault as a shared folder** — `POST /rest/config/folders`:
    - Folder ID: `obsidian-vault`
    - Path: `/root/obsidian-vault`
-   - Type: `sendreceive`
+   - Type: `sendonly` — VPS is the sole writer; clients mirror read-only
    - File watcher: enabled, 5s delay
-   - Versioning: `simple` with 5 versions kept (cheap safety net for accidental deletes from either side)
+   - Versioning: `simple` with 5 versions kept (cheap safety net for accidental deletes on the VPS side)
    - Devices: empty for now — added in Phase 3 once the Windows Device ID is known.
-5. **Write `.stignore`** inside the vault:
+5. **Write `.stignore`** inside the vault (propagates down to clients, so one setup covers all mirrors; keeps Obsidian per-device UI state from polluting sync as "local additions" on read-only clients):
    ```
-   .obsidian/workspace.json
-   .obsidian/workspace-*.json
-   .obsidian/cache
+   .obsidian/workspace*
+   .obsidian/cache*
+   .obsidian/graph.json
+   .obsidian/app.json
    .trash/
    ```
 6. **No explicit restart needed** — REST config changes are applied live.
@@ -91,14 +97,17 @@ In the Syncthing web UI → bottom right → **Add Remote Device**:
 
 In the Syncthing web UI → top-right **Actions → Show ID** → copy the long `XXXXXXX-XXXXXXX-...` string and paste it back to the VPS-side Claude. The VPS side then pre-approves this device and shares the `obsidian-vault` folder with it.
 
-### 4.5 Accept the folder share prompt
+### 4.5 Accept the folder share prompt — as Receive Only
 
 Within ~30 seconds of the VPS adding your Device ID, the Windows Syncthing UI shows **"VPS wants to share folder obsidian-vault"**:
 1. Click **Add**
 2. **Folder Path**: `C:\Users\<you>\ObsidianVault` (or wherever you prefer)
-3. Save
+3. **Advanced tab → Folder Type: `Receive Only`** — this is the critical step. The Windows installer's device template may default `autoAcceptFolders=true` on new remote devices, which causes the offer to be auto-accepted as `sendreceive` before you can intervene. If that happens, patch the folder back to `receiveonly` immediately via `PATCH /rest/config/folders/obsidian-vault` (body: `{"type":"receiveonly"}`) and verify `receiveOnlyTotalItems: 0` on the folder status.
+4. Save
 
 Initial sync runs (near-instant — vault is tiny).
+
+**Behavioral consequence:** Obsidian on Windows can read and render the vault (including graph view), but any edit/create/delete it makes stays local and is flagged as "Local Additions." Use the **Revert Local Changes** button to roll them back. Nothing from the Windows side ever reaches the VPS.
 
 ### 4.6 Install Obsidian Desktop
 
@@ -124,10 +133,17 @@ Initial sync runs (near-instant — vault is tiny).
 
 ## Phase 6 — Sanity test end-to-end
 
-1. **VPS → Windows test** — I create a file `/root/obsidian-vault/test-from-vps.md`; confirm it appears in your Obsidian within seconds
-2. **Windows → VPS test** — you create a note in Obsidian; I confirm the file appears on VPS
-3. **Claude memory test** — I trigger a memory save; confirm it lands in `claude-memory/` and syncs to your Obsidian
-4. **Clean up test files**
+1. **VPS → Windows propagation** — I create `/root/obsidian-vault/test-from-vps.md`; confirm it appears in your Obsidian within seconds.
+2. **Windows → VPS isolation** (inverted from the old sendreceive model — the test now verifies the write is *blocked*, not that it propagates):
+   - You create a file (e.g. `test-from-windows.md`) inside `C:\Users\<you>\ObsidianVault\` either in Explorer or from Obsidian.
+   - **Expected on Windows:** within seconds the Syncthing UI shows the folder with non-zero **Local Additions** (or `receiveOnlyTotalItems > 0` via `GET /rest/db/status?folder=obsidian-vault`). File stays on disk locally.
+   - **Expected on VPS:** the file does **not** appear in `/root/obsidian-vault/`. `ls` on the VPS must not show it. `GET /rest/db/status?folder=obsidian-vault` on the VPS shows no new item in `globalFiles`.
+   - Clean up by clicking **Revert Local Changes** in the Windows UI → the file is removed locally; both sides are back in sync.
+3. **Rename propagation VPS → Windows** — rename a file on the VPS, confirm the rename (not duplicate) lands on Windows.
+4. **Claude memory test** — I trigger a memory save on the VPS; confirm it lands in `claude-memory/` and syncs to your Obsidian.
+5. **Clean up test files** on the VPS (the sole writer).
+
+**Pass criteria:** tests 1, 3, 4 propagate cleanly VPS → client; test 2 confirms the client-side write is contained on the client and **never** reaches the VPS. Any failure of test 2 means the folder type was not actually set to `receiveonly` on the client — re-patch and re-run before considering the setup done.
 
 ---
 
@@ -151,6 +167,7 @@ Initial sync runs (near-instant — vault is tiny).
 4. **VS Code Remote-SSH auto-forwards ports** — if you have a VS Code Remote-SSH session open to the VPS, VS Code may silently forward `localhost:8384` from Windows to the VPS's loopback Syncthing UI. Symptom: on Windows you open `http://localhost:8384`, see a login page, and the VPS admin credentials work on it. That's not Windows Syncthing — that's the VPS's UI. Fix: either close the VS Code SSH session before installing Windows Syncthing, or let SyncthingWindowsSetup fall back to port 8385 on Windows. This was the single biggest source of confusion during first setup.
 5. **SyncTrayzor is abandoned** (last real release 2023) — using it against modern Syncthing (v1.27+) produces `unknown flag -n` errors because legacy flags were removed. If you inherit a machine with SyncTrayzor already installed, uninstall it before anything else.
 6. **Windows case-insensitive filesystem vs VPS case-sensitive** — `Note.md` and `note.md` are two files on the VPS but collide on Windows. Syncthing detects and logs these as errors. Avoid creating such pairs; if you see a case-conflict error in the Syncthing log, one of them has to be renamed.
+7. **Windows `autoAcceptFolders=true` default** — SyncthingWindowsSetup's device template may set `autoAcceptFolders=true`, which causes a freshly-offered folder to be auto-accepted as `sendreceive` before the receive-only setting can be applied. Mitigation: (a) set `"autoAcceptFolders": false` on the VPS device entry when adding it on Windows, and (b) immediately after acceptance, verify folder type is `receiveonly` and patch it if not. See Execution notes below for the real-world occurrence.
 
 ---
 
@@ -180,6 +197,11 @@ Recorded here so the plan matches what actually happened, not just the theory.
 - Windows accepted folder share, set path `C:\Users\<user>\ObsidianVault`.
 - Obsidian Desktop installed on Windows, vault opened successfully.
 
+**Role-model correction (post-initial-setup):**
+- VPS folder patched from `sendreceive` → `sendonly` via `PATCH /rest/config/folders/obsidian-vault`.
+- `.stignore` updated to the expanded pattern set (`.obsidian/workspace*`, `.obsidian/cache*`, `.obsidian/graph.json`, `.obsidian/app.json`, `.trash/`) so Obsidian per-device UI state on read-only clients isn't flagged as "local additions."
+- Windows side: folder auto-accepted as `sendreceive` (installer's device-template quirk — `autoAcceptFolders=true` defaulted on) instead of queuing as a pending offer. Corrected on Windows via `PATCH /rest/config/folders/obsidian-vault` → `{"type":"receiveonly"}`. Post-correction state: `receiveOnlyTotalItems: 0`, `receiveOnlyChangedBytes: 0`, all 47 files synced cleanly, no conflicts. `autoAcceptFolders=false` set on the VPS device entry on Windows to prevent recurrence.
+
 **Phase 5 (completed) — Claude memory in vault:**
 - `/root/.claude/projects/-root-projects-bdi-senior-developer/memory` symlinked → `/root/obsidian-vault/claude-memory/`.
 - `MEMORY.md` index + `MOC.md` graph-view entry point + first real memory (`memory_location.md` documenting the symlink itself) written and synced to Windows at 100%.
@@ -188,9 +210,17 @@ Recorded here so the plan matches what actually happened, not just the theory.
 | Test | Result |
 |---|---|
 | VPS → Windows | ✅ `test-from-vps.md` synced within seconds |
-| Windows → VPS | ✅ `Untitled.md` then renamed to `test-from-windows.md` synced |
+| Windows → VPS | ✅ `Untitled.md` then renamed to `test-from-windows.md` synced *(run under the old `sendreceive` model — superseded by the isolation test below)* |
 | Rename propagation | ✅ confirmed (old snapshot captured in `.stversions/`) |
 | Claude memory writes via symlink | ✅ all 3 memory files reached Windows |
+
+**Isolation re-test (post role-model correction — needs to be run to confirm the new contract):**
+| Test | Expected | Run? |
+|---|---|---|
+| Windows creates file → must NOT appear on VPS | Windows shows it as "Local Addition"; VPS `ls /root/obsidian-vault/` doesn't list it | ⬜ pending |
+| `Revert Local Changes` on Windows | Local file removed on Windows; nothing changes on VPS | ⬜ pending |
+
+Until both rows above are ✅, treat the receive-only contract as unverified in production behavior (the folder-type flag is set, but we haven't round-tripped an actual write to prove isolation).
 
 **Gotchas that bit us (documented in Risks section):**
 1. VS Code Remote-SSH auto-forwarded `localhost:8384` from Windows → VPS UI, masquerading as a local Syncthing. Cost ~20 minutes of debugging. Fix: always use `127.0.0.1` explicitly + SyncthingWindowsSetup fell back to port 8385 automatically.
