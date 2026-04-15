@@ -1,28 +1,68 @@
-# Linux-Local Claude — Read-Only Mirror Onboarding
+# Linux-Local Claude — Read-Only Mirror Setup & Operations
 
-> **Paired instruction file:** [`vps-claude.md`](./vps-claude.md) — runbook for the Claude instance on the VPS. Read it first so you know what the other side will be doing and what to hand back.
-> **Architecture context:** [`../PLAN-LINUX.md`](../PLAN-LINUX.md) — full setup plan, including the role model.
+> **Paired file:** [`vps-claude.md`](./vps-claude.md) — runbook for the Claude instance on the VPS. Read it first so you know what the other side will do and what to hand back.
 
-## Your role
+Self-contained runbook for the Claude instance on a **Linux desktop/laptop** client. Covers install, pairing, receive-only acceptance, Obsidian setup, tests, gotchas.
 
-You are running on a **Linux desktop/laptop**. Your job is to make this host a **read-only mirror** of the VPS's `obsidian-vault`. The VPS is the sole writer. Anything you (or Obsidian) create here stays local and gets reverted on next sync pass — that is the intended behavior.
+---
 
-## Linux-side invariants to achieve
+## 1. Architecture & role model
+
+Your machine syncs `~/ObsidianVault` (read-only mirror) against the VPS's `/root/obsidian-vault/` (sole writer). Obsidian Desktop opens the local folder.
+
+- VPS folder type: `sendonly`.
+- Your folder type: `receiveonly` — Obsidian can read/render everything; local edits are flagged as "Local Additions" and reverted on demand. They never reach the VPS.
+- Rationale: prevents two-writer conflicts and accidental plugin writes on the client side.
+
+---
+
+## 2. Linux-side invariants to achieve
 
 | Setting | Required value | Why |
 |---|---|---|
-| Syncthing service | `systemctl --user` (not root) | Runs as your desktop user; correct ownership on synced files |
-| Lingering | `loginctl enable-linger "$USER"` | Service keeps running after logout |
-| inotify watches | `fs.inotify.max_user_watches=524288` | Obsidian + Syncthing blow past the 8192 default on real vaults |
-| VPS device entry | `autoAcceptFolders: false` | Prevents surprise-accept of folder offers as `sendreceive` |
-| Folder `obsidian-vault` type | `receiveonly` | Local edits contained; VPS-originated state is authoritative |
+| Syncthing service | `systemctl --user` (not root) | Correct ownership on synced files |
+| Lingering | `loginctl enable-linger "$USER"` | Keeps service running after logout |
+| inotify watches | `fs.inotify.max_user_watches=524288` | Obsidian + Syncthing blow past 8192 default |
+| VPS device entry | `autoAcceptFolders: false` | Prevents surprise-accept as `sendreceive` |
+| Folder `obsidian-vault` type | `receiveonly` | Local edits contained; VPS state authoritative |
 | `receiveOnlyTotalItems` | `0` | Proves no stray local divergence |
-| Folder path | `~/ObsidianVault` (or user's preference) | The VPS side does not care about the path, only the folder ID |
+| Folder path | `~/ObsidianVault` | VPS doesn't care about the path, only folder ID |
 
-## Finding your API key + UI port
+---
+
+## 3. Install Syncthing
+
+Pick per distro:
+- **Debian/Ubuntu:** add Syncthing's apt repo, `sudo apt install syncthing`.
+- **Fedora/RHEL:** `sudo dnf install syncthing`.
+- **Arch/Manjaro:** `sudo pacman -S syncthing`.
+- **openSUSE:** `sudo zypper install syncthing`.
+
+Enable as user systemd service (not root):
 
 ```bash
-# Config lives in one of these (newer installs use the first)
+systemctl --user enable --now syncthing.service
+loginctl enable-linger "$USER"
+```
+
+Config lives at `~/.local/state/syncthing/` (or `~/.config/syncthing/` on older installs).
+
+---
+
+## 4. Bump inotify watch limit
+
+Obsidian + Syncthing can blow past the default 8192 watches:
+
+```bash
+echo 'fs.inotify.max_user_watches=524288' | sudo tee /etc/sysctl.d/99-syncthing.conf
+sudo sysctl --system
+```
+
+---
+
+## 5. Find your API key, port, and Device ID
+
+```bash
 CONFIG="${XDG_STATE_HOME:-$HOME/.local/state}/syncthing/config.xml"
 [ -f "$CONFIG" ] || CONFIG="$HOME/.config/syncthing/config.xml"
 
@@ -30,66 +70,126 @@ API=$(grep -oP '<apikey>\K[^<]+' "$CONFIG")
 PORT=$(grep -oP 'address>127\.0\.0\.1:\K\d+' "$CONFIG" | head -1)
 BASE="http://127.0.0.1:$PORT/rest"
 
-# Your Device ID
+# Own Device ID
 curl -sH "X-API-Key: $API" "$BASE/system/status" | jq -r .myID
 ```
 
-> **Gotcha:** if you see a login page at `http://localhost:8384` that accepts the **VPS's** admin creds, that's a VS Code Remote-SSH port-forward tunneling to the VPS's UI, not your local Syncthing. Use `http://127.0.0.1:$PORT` explicitly, or close the VS Code SSH session.
+> **Gotcha:** if `http://localhost:8384` shows a login page that accepts the **VPS's** admin creds, that's a VS Code Remote-SSH port-forward tunneling to the VPS's UI — not your local Syncthing. Use `http://127.0.0.1:$PORT` explicitly or close the VS Code SSH session.
 
-## Onboarding flow
+---
 
-1. **Pre-flight:** confirm Syncthing is installed, `systemctl --user is-active syncthing` returns `active`, and lingering is enabled (`loginctl show-user "$USER" | grep Linger=yes`). Bump inotify watches if not already done.
-2. **Get your Device ID** (command above) and hand it to the VPS-side Claude.
+## 6. Onboarding flow
+
+1. **Pre-flight:** `systemctl --user is-active syncthing` → `active`; lingering on (`loginctl show-user "$USER" | grep Linger=yes`); inotify bumped.
+2. **Hand your Device ID to the VPS-side Claude.** They'll pre-approve you and share the folder (see `vps-claude.md` §6).
 3. **Add the VPS as a remote device** with `autoAcceptFolders: false`:
    ```bash
    curl -sX PUT -H "X-API-Key: $API" -H "Content-Type: application/json" \
      -d '{"deviceID":"<VPS-DEVICE-ID>","name":"VPS","compression":"metadata","autoAcceptFolders":false,"addresses":["dynamic","tcp://<VPS-IP>:22000"]}' \
      "$BASE/config/devices/<VPS-DEVICE-ID>"
    ```
-4. **Wait for the folder offer.** When the VPS shares the folder, Syncthing will queue it as a pending offer (expected — Linux Syncthing respects the `autoAcceptFolders=false` flag cleanly, unlike the Windows installer's template quirk).
-5. **Accept as Receive Only via the UI**: Advanced tab → Folder Type: `Receive Only`, path `~/ObsidianVault`. Or via API:
+4. **Wait for the folder offer.** Linux Syncthing respects `autoAcceptFolders=false` cleanly (unlike the Windows installer's template quirk), so the offer will queue as pending.
+5. **Accept as Receive Only** via the UI (Advanced tab → Folder Type: `Receive Only`, path `~/ObsidianVault`), or via API:
    ```bash
+   MYID=$(curl -sH "X-API-Key: $API" "$BASE/system/status" | jq -r .myID)
    curl -sX POST -H "X-API-Key: $API" -H "Content-Type: application/json" \
-     -d '{"id":"obsidian-vault","label":"Obsidian Vault","path":"'"$HOME"'/ObsidianVault","type":"receiveonly","devices":[{"deviceID":"'"$(curl -sH "X-API-Key: $API" "$BASE/system/status" | jq -r .myID)"'"},{"deviceID":"<VPS-DEVICE-ID>"}],"fsWatcherEnabled":true,"fsWatcherDelayS":10}' \
+     -d '{"id":"obsidian-vault","label":"Obsidian Vault","path":"'"$HOME"'/ObsidianVault",
+          "type":"receiveonly",
+          "devices":[{"deviceID":"'"$MYID"'"},{"deviceID":"<VPS-DEVICE-ID>"}],
+          "fsWatcherEnabled":true,"fsWatcherDelayS":10}' \
      "$BASE/config/folders"
    ```
 6. **Verify clean state:**
    ```bash
    curl -sH "X-API-Key: $API" "$BASE/config/folders/obsidian-vault" | jq .type
-   # -> "receiveonly"
+   # "receiveonly"
    curl -sH "X-API-Key: $API" "$BASE/db/status?folder=obsidian-vault" | jq '{receiveOnlyTotalItems, receiveOnlyChangedBytes}'
-   # -> both 0
+   # both 0
    ```
    If `receiveOnlyTotalItems > 0`, revert:
    ```bash
    curl -sX POST -H "X-API-Key: $API" "$BASE/db/revert?folder=obsidian-vault"
    ```
-7. **Report back to the VPS-side Claude:** folder type, `receiveOnlyTotalItems`, connection status.
-8. **Run the isolation test with them** (see next section).
+7. **Report to VPS Claude:** folder type, `receiveOnlyTotalItems`, connection status.
+8. **Run isolation test jointly** (§8).
 
-## Isolation test protocol (run jointly with VPS-side Claude)
+---
 
-1. VPS-side Claude snapshots `/root/obsidian-vault/`.
-2. Your turn: `echo "test" > ~/ObsidianVault/test-from-linux.md`.
-3. Wait ~30 seconds. Verify:
+## 7. Install Obsidian Desktop
+
+| Method | Command | Notes |
+|---|---|---|
+| **Flatpak** (recommended) | `flatpak install flathub md.obsidian.Obsidian` | Sandboxed, auto-updates |
+| **AppImage** | Download from [obsidian.md](https://obsidian.md), chmod +x, run | Manual updates |
+| **.deb** (Debian/Ubuntu) | `sudo dpkg -i obsidian-*.deb` | Official download |
+| **Snap** | `sudo snap install obsidian --classic` | Works; Flatpak is better maintained |
+| **AUR** (Arch) | `yay -S obsidian` or `sudo pacman -S obsidian` | `extra/obsidian` is in official repos |
+
+Open Obsidian → *Open folder as vault* → select `~/ObsidianVault`.
+
+**Flatpak sandboxing:** Flatpak Obsidian may not see `~/ObsidianVault` by default. Grant access:
+```bash
+flatpak override --user --filesystem=~/ObsidianVault md.obsidian.Obsidian
+```
+
+---
+
+## 8. Isolation test protocol (joint with VPS-side Claude)
+
+1. VPS snapshots `/root/obsidian-vault/`.
+2. Your turn: `echo test > ~/ObsidianVault/test-from-linux.md`.
+3. Wait ~30 seconds:
    ```bash
    curl -sH "X-API-Key: $API" "$BASE/db/status?folder=obsidian-vault" | jq .receiveOnlyTotalItems
-   # -> > 0
+   # > 0
    ```
-4. VPS-side Claude confirms the file did **not** appear on `/root/obsidian-vault/`. If it did, the test failed — folder type is wrong; stop and debug.
-5. Revert: `curl -sX POST -H "X-API-Key: $API" "$BASE/db/revert?folder=obsidian-vault"`. The local file disappears.
+4. VPS Claude confirms the file did **not** appear on `/root/obsidian-vault/`. If it did, the test failed — folder type is wrong; stop and debug.
+5. Revert: `curl -sX POST -H "X-API-Key: $API" "$BASE/db/revert?folder=obsidian-vault"`. File disappears locally.
 6. Re-verify `receiveOnlyTotalItems: 0`.
 
-**Pass criteria:** step 4 shows zero propagation from Linux to VPS. Any propagation = folder type drifted or was never applied.
+**Pass criteria:** step 4 shows zero propagation.
 
-## Day-to-day expectations for the user
+---
 
-- **Obsidian can open the vault and render it** (graph view included). All read-side features work.
-- **Edits / new notes / deletes in Obsidian stay on Linux only** and are rolled back on the next Revert Local Changes pass. This is the intended contract.
-- **Ignore patterns** from the VPS's `.stignore` apply here too — Obsidian UI state won't show up as Local Additions.
+## 9. Day-to-day expectations for the user
 
-## What NOT to do
+- **Obsidian opens and renders normally** — graph view, plugins, all read-side features work.
+- **Edits / new notes / deletes stay on Linux only** and are rolled back by Revert Local Changes. Intended contract.
+- **Ignore patterns from the VPS's `.stignore`** apply locally — Obsidian UI state doesn't flag as Local Additions under normal use.
+
+---
+
+## 10. Rollback
+
+- Stop + disable: `systemctl --user disable --now syncthing`.
+- Purge config + DB: `rm -rf ~/.local/state/syncthing` (or `~/.config/syncthing`).
+- Local vault folder (`~/ObsidianVault`) is yours to keep or delete.
+
+---
+
+## 11. Gotchas (Linux side)
+
+1. **inotify watches** — if logs show `too many open files` or `no space left on device` referencing inotify, raise `fs.inotify.max_user_watches` to 1048576.
+2. **Flatpak sandboxing** — see §7 for the `flatpak override` to grant vault access.
+3. **Systemd user service lingering** — without `loginctl enable-linger`, Syncthing stops when your user logs out.
+4. **SELinux / AppArmor** — on enforcing SELinux (Fedora/RHEL), if the vault is on NFS or a non-standard path, you may need extra booleans. Not needed for a local home dir.
+5. **VS Code Remote-SSH port-forward** — auto-forwards `localhost:8384` to the VPS's UI. Symptom: login page at `http://localhost:8384` accepts the VPS's creds. Fix: use `http://127.0.0.1:$PORT` explicitly or close the VS Code SSH session.
+6. **Multiple Linux devices** — you can pair a laptop + desktop; the VPS stays the sole writer, both clients mirror.
+
+---
+
+## 12. Advantages over a Windows client
+
+- No antivirus interference with file locks.
+- inotify beats Windows's `ReadDirectoryChangesW` on high-frequency changes.
+- Case-sensitive filenames match the VPS — zero cross-OS filename collisions.
+- Same Syncthing binary, config format, and REST API as the VPS — copy templates verbatim.
+- Scriptable end-to-end: pairing, folder-add, etc. can be fully automated via REST without clicking through the UI.
+
+---
+
+## 13. What NOT to do
 
 - Do not flip folder type back to `sendreceive`.
-- Do not `DELETE` the folder to "reset" it without coordinating with the VPS-side Claude.
-- Do not expose the Syncthing Web UI off-host.
+- Do not `DELETE` the folder to "reset" without coordinating with the VPS-side Claude.
+- Do not expose the Syncthing web UI off-host.
